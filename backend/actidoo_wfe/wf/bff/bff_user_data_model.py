@@ -104,6 +104,10 @@ def _user_has_read_access(user, descriptor: DataModelDescriptor, db: Session) ->
         return False
     if not descriptor.api.read_roles:
         return True
+    # `user` arrives detached from get_user (its own session was closed and
+    # expire_on_commit cleared every attribute). Re-attach to the current
+    # request-scoped session so `user.roles` can lazy-load.
+    user = db.merge(user, load=False)
     user_roles = {r.role.name for r in user.roles}
     return bool(user_roles & set(descriptor.api.read_roles))
 

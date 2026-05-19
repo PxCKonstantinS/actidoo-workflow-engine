@@ -9,7 +9,7 @@ from unittest.mock import MagicMock
 from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column
 
-from actidoo_wfe.database import SessionLocal, setup_db
+from actidoo_wfe.database import get_db_contextmanager, setup_db
 from actidoo_wfe.settings import settings
 from actidoo_wfe.wf import service_user
 from actidoo_wfe.wf.bff.bff_user_data_model import (
@@ -202,6 +202,11 @@ class TestSerialization:
 
 
 class TestAccessControl:
+    def _mock_db(self, user):
+        db = MagicMock()
+        db.merge.return_value = user
+        return db
+
     def test_user_has_read_access_no_roles(self):
         """No read_roles restriction = all authenticated users have access."""
         api_cfg = WorkflowDataApiConfig(read_roles=[])
@@ -213,7 +218,7 @@ class TestAccessControl:
         )
         user = MagicMock()
         user.roles = []
-        assert _user_has_read_access(user, descriptor, MagicMock()) is True
+        assert _user_has_read_access(user, descriptor, self._mock_db(user)) is True
 
     def test_user_has_read_access_with_role(self):
         api_cfg = WorkflowDataApiConfig(read_roles=["viewer"])
@@ -227,7 +232,7 @@ class TestAccessControl:
         role_mock.role.name = "viewer"
         user = MagicMock()
         user.roles = [role_mock]
-        assert _user_has_read_access(user, descriptor, MagicMock()) is True
+        assert _user_has_read_access(user, descriptor, self._mock_db(user)) is True
 
     def test_user_lacks_read_access(self):
         api_cfg = WorkflowDataApiConfig(read_roles=["admin"])
@@ -241,7 +246,7 @@ class TestAccessControl:
         role_mock.role.name = "viewer"
         user = MagicMock()
         user.roles = [role_mock]
-        assert _user_has_read_access(user, descriptor, MagicMock()) is False
+        assert _user_has_read_access(user, descriptor, self._mock_db(user)) is False
 
     def test_no_api_config(self):
         descriptor = DataModelDescriptor(
@@ -252,45 +257,58 @@ class TestAccessControl:
         )
         user = MagicMock()
         user.roles = []
-        assert _user_has_read_access(user, descriptor, MagicMock()) is False
+        assert _user_has_read_access(user, descriptor, self._mock_db(user)) is False
 
 
 class TestAccessControlDetached:
-    """Regression: user from BFF/API deps is detached when ``_user_has_read_access``
-    reads ``user.roles``. Without eager-loading in ``upsert_user``, this raises
-    ``sqlalchemy.orm.exc.DetachedInstanceError``.
+    """Regression: ``get_user`` opens its own ``get_db_contextmanager`` and
+    returns the user after exit. The implicit commit() expires every attribute
+    (expire_on_commit=True), so reading ``user.roles`` in
+    ``_user_has_read_access`` raises ``DetachedInstanceError`` unless the user
+    is re-merged into the request-scoped session.
     """
 
-    def _upsert_with_role(self, db, idp_user_id, email, role_name):
-        user = service_user.upsert_user(
-            db=db,
-            idp_user_id=idp_user_id,
-            username=email,
-            email=email,
-            first_name="D",
-            last_name="T",
-            is_service_user=False,
-            initial_locale="en-US",
-        )
-        service_user.assign_roles(db=db, user_id=user.id, role_names=[role_name])
-        # Second upsert mirrors what bff/deps.get_user does on every request:
-        # the eager-load runs after roles already exist.
-        return service_user.upsert_user(
-            db=db,
-            idp_user_id=idp_user_id,
-            username=email,
-            email=email,
-            first_name="D",
-            last_name="T",
-            is_service_user=False,
-            initial_locale="en-US",
-        )
+    def _make_detached_user(self, idp_user_id, email, role_name):
+        # Mirror bff/deps.get_user: own context-manager, user comes back detached.
+        with get_db_contextmanager() as db:
+            service_user.upsert_user(
+                db=db,
+                idp_user_id=idp_user_id,
+                username=email,
+                email=email,
+                first_name="D",
+                last_name="T",
+                is_service_user=False,
+                initial_locale="en-US",
+            )
+        with get_db_contextmanager() as db:
+            user = service_user.upsert_user(
+                db=db,
+                idp_user_id=idp_user_id,
+                username=email,
+                email=email,
+                first_name="D",
+                last_name="T",
+                is_service_user=False,
+                initial_locale="en-US",
+            )
+            service_user.assign_roles(db=db, user_id=user.id, role_names=[role_name])
+        with get_db_contextmanager() as db:
+            user = service_user.upsert_user(
+                db=db,
+                idp_user_id=idp_user_id,
+                username=email,
+                email=email,
+                first_name="D",
+                last_name="T",
+                is_service_user=False,
+                initial_locale="en-US",
+            )
+        return user  # detached + expired
 
     def test_user_has_read_access_after_session_close(self, db_engine_ctx):
         with db_engine_ctx():
-            db = SessionLocal()
-            user = self._upsert_with_role(db, "detach-test", "detach@example.com", "viewer")
-            db.close()  # Simulates leaving the `with get_db_contextmanager()` block
+            user = self._make_detached_user("detach-test", "detach@example.com", "viewer")
 
             api_cfg = WorkflowDataApiConfig(read_roles=["viewer"])
             descriptor = DataModelDescriptor(
@@ -299,17 +317,12 @@ class TestAccessControlDetached:
                 namespace="apitest",
                 api=api_cfg,
             )
-            new_db = SessionLocal()
-            try:
+            with get_db_contextmanager() as new_db:
                 assert _user_has_read_access(user, descriptor, new_db) is True
-            finally:
-                new_db.close()
 
     def test_user_without_matching_role_after_session_close(self, db_engine_ctx):
         with db_engine_ctx():
-            db = SessionLocal()
-            user = self._upsert_with_role(db, "detach-test-2", "detach2@example.com", "viewer")
-            db.close()
+            user = self._make_detached_user("detach-test-2", "detach2@example.com", "viewer")
 
             api_cfg = WorkflowDataApiConfig(read_roles=["admin"])
             descriptor = DataModelDescriptor(
@@ -318,11 +331,8 @@ class TestAccessControlDetached:
                 namespace="apitest",
                 api=api_cfg,
             )
-            new_db = SessionLocal()
-            try:
+            with get_db_contextmanager() as new_db:
                 assert _user_has_read_access(user, descriptor, new_db) is False
-            finally:
-                new_db.close()
 
 
 # ---------------------------------------------------------------------------
