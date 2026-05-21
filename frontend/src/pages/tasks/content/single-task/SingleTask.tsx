@@ -318,7 +318,7 @@ const SingleTask: React.FC<SingleTaskProps> = props => {
               rows={3}
               placeholder="Add an optional comment"
               onInput={event => {
-                setDelegateComment(event.currentTarget.value);
+                setDelegateComment(event.currentTarget?.value ?? '');
               }}
             />
           </div>
