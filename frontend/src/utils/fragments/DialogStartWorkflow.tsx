@@ -7,11 +7,13 @@ import {
   ButtonDesign,
   Dialog,
   Icon,
+  Input,
   Text,
   Title,
   TitleLevel,
 } from '@ui5/webcomponents-react';
-import React, { useEffect, useState } from 'react';
+import type { DialogDomRef } from '@ui5/webcomponents-react';
+import React, { useEffect, useRef, useState } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { getRequest, postRequest, resetStateForKey } from '@/store/generic-data/actions';
 import { WeDataKey } from '@/store/generic-data/setup';
@@ -30,10 +32,69 @@ export const DialogStartWorkflow: React.FC = () => {
   const dispatch = useDispatch();
   const navigate = useNavigate();
   const [open, setDialogOpen] = useState(false);
+  const [search, setSearch] = useState('');
+  const dialogRef = useRef<DialogDomRef>(null);
+  const [lockedSize, setLockedSize] = useState<{ height: number; width: number } | null>(null);
+
+  const handleSearchInput = (value: string): void => {
+    if (value && !search && dialogRef.current) {
+      const rect = dialogRef.current.getBoundingClientRect();
+      setLockedSize({ height: rect.height, width: rect.width });
+    } else if (!value) {
+      setLockedSize(null);
+    }
+    setSearch(value);
+  };
 
   const workflowData = useSelector((state: State) => state.data[WeDataKey.WORKFLOWS]);
   const startData = useSelector((state: State) => state.data[WeDataKey.START_WORKFLOW]);
   const workflowOptions = workflowData?.data?.workflows;
+
+  const buildSearchRegExp = (query: string): RegExp | null => {
+    if (!query) return null;
+    try {
+      return new RegExp(query, 'gi');
+    } catch {
+      return new RegExp(query.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    }
+  };
+
+  const matchesSearch = (title: string, query: string): boolean => {
+    const regex = buildSearchRegExp(query);
+    return regex ? regex.test(title) : true;
+  };
+
+  const highlightMatch = (title: string, query: string): React.ReactNode => {
+    const regex = buildSearchRegExp(query);
+    if (!regex) return title;
+
+    const parts: React.ReactNode[] = [];
+    let lastIndex = 0;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(title)) !== null) {
+      if (match[0].length === 0) {
+        regex.lastIndex++;
+        continue;
+      }
+      if (match.index > lastIndex) parts.push(title.slice(lastIndex, match.index));
+      parts.push(
+        <span key={match.index} className="!text-brand-primary !font-bold">
+          {match[0]}
+        </span>
+      );
+      lastIndex = match.index + match[0].length;
+    }
+    if (lastIndex < title.length) parts.push(title.slice(lastIndex));
+    return parts.length > 0 ? parts : title;
+  };
+
+  const filteredWorkflows = workflowOptions?.filter(w => matchesSearch(w.title, search));
+
+  const closeDialog = (): void => {
+    setDialogOpen(false);
+    setSearch('');
+    setLockedSize(null);
+  };
 
   const loadingState = useSelector((state: State) => state.ui.loading);
   const isLoading =
@@ -49,7 +110,7 @@ export const DialogStartWorkflow: React.FC = () => {
         postRequest(WeDataKey.WORKFLOW_INSTANCES_WITH_TASKS, {}, { state: WorkflowState.READY })
       );
       dispatch(addToast(<WeToastContent type="success" text={t('dialogStartWorkflow.success')} />));
-      setDialogOpen(false);
+      closeDialog();
       if (startData.data?.workflow_instance_id)
         navigate(`/tasks/open/${startData.data?.workflow_instance_id}`);
     } else if (startData?.postResponse && startData?.postResponse !== 200) {
@@ -80,19 +141,22 @@ export const DialogStartWorkflow: React.FC = () => {
       </Button>
       {createPortal(
         <Dialog
+          ref={dialogRef}
           open={open}
+          style={
+            lockedSize
+              ? {
+                  minHeight: `min(${lockedSize.height}px, 94%)`,
+                  width: `min(${lockedSize.width}px, 90%)`,
+                }
+              : undefined
+          }
           header={
             <div className="w-full flex items-center gap-2">
               <Title level={TitleLevel.H5} className="w-full py-2">
                 {t('dialogStartWorkflow.header')}
               </Title>
-              <Icon
-                className="cursor-pointer "
-                name="decline"
-                onClick={() => {
-                  setDialogOpen(false);
-                }}
-              />
+              <Icon className="cursor-pointer " name="decline" onClick={closeDialog} />
             </div>
           }>
           {workflowOptions ? (
@@ -102,33 +166,57 @@ export const DialogStartWorkflow: React.FC = () => {
               delay={0}
               className="bg-white/80 w-full">
               <div className="w-full">
-                {workflowOptions?.map(w => (
-                  <div
-                    key={`workflow_${w.name}`}
-                    className="flex items-center justify-between py-2 pr-4 w-full">
-                    <div className="flex items-center gap-2">
-                      <Link
-                        to={`workflow-diagram/${w.name}`}
-                        onClick={() => {
-                          setDialogOpen(false);
-                        }}
-                        className="inline-flex">
+                <Input
+                  className="w-full mb-2"
+                  icon={
+                    <>
+                      {search && (
                         <Icon
-                          name="org-chart"
-                          className="!font-bold !text-brand-primary cursor-pointer"
+                          name="decline"
+                          className="cursor-pointer -mr-2"
+                          onClick={() => {
+                            handleSearchInput('');
+                          }}
                         />
-                      </Link>
-                      <Text>{w.title}</Text>
+                      )}
+                      <Icon name="search" />
+                    </>
+                  }
+                  placeholder={t('dialogStartWorkflow.searchPlaceholder')}
+                  value={search}
+                  onInput={e => {
+                    handleSearchInput(e.target.value ?? '');
+                  }}
+                />
+                {filteredWorkflows && filteredWorkflows.length > 0 ? (
+                  filteredWorkflows.map(w => (
+                    <div
+                      key={`workflow_${w.name}`}
+                      className="flex items-center justify-between py-2 pr-4 w-full">
+                      <div className="flex items-center gap-2">
+                        <Link
+                          to={`workflow-diagram/${w.name}`}
+                          onClick={closeDialog}
+                          className="inline-flex">
+                          <Icon
+                            name="org-chart"
+                            className="!font-bold !text-brand-primary cursor-pointer"
+                          />
+                        </Link>
+                        <Text>{highlightMatch(w.title, search)}</Text>
+                      </div>
+                      <Text
+                        className="!font-bold !text-brand-primary cursor-pointer"
+                        onClick={() => {
+                          dispatch(postRequest(WeDataKey.START_WORKFLOW, { name: w.name }));
+                        }}>
+                        {t('dialogStartWorkflow.start')}
+                      </Text>
                     </div>
-                    <Text
-                      className="!font-bold !text-brand-primary cursor-pointer"
-                      onClick={() => {
-                        dispatch(postRequest(WeDataKey.START_WORKFLOW, { name: w.name }));
-                      }}>
-                      {t('dialogStartWorkflow.start')}
-                    </Text>
-                  </div>
-                ))}
+                  ))
+                ) : (
+                  <Text>{t('dialogStartWorkflow.noneFound')}</Text>
+                )}
               </div>
             </BusyIndicator>
           ) : (

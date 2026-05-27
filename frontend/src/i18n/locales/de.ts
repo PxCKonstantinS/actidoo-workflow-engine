@@ -353,6 +353,7 @@ export const de = {
   dialogStartWorkflow: {
     startWorkflow: 'Workflow starten',
     header: 'Workflows',
+    searchPlaceholder: 'Workflow suchen',
     start: 'Starten',
     noneFound: 'Keine Workflows gefunden',
     success: 'Workflow erfolgreich gestartet',
