@@ -30,9 +30,46 @@ const WeUserAutocomplete: React.FC<AdminUserAutocompleteProps> = props => {
       ? searchWfUsers.filter(user => !props.excludeUserIds?.includes(user.value))
       : searchWfUsers;
 
+  const selectedLabel = useRef<string | null>(null);
+  const filteredUsersRef = useRef(filteredUsers);
+  filteredUsersRef.current = filteredUsers;
+  const onSelectUserRef = useRef(props.onSelectUser);
+  onSelectUserRef.current = props.onSelectUser;
+
+  const selectUser = (value?: string, label?: string): void => {
+    selectedLabel.current = value ? label ?? null : null;
+    onSelectUserRef.current?.(value, label);
+  };
+
   useEffect(() => {
     void Suggestions.init();
     fetchUserData();
+  }, []);
+
+  useEffect(() => {
+    const el = inputEl.current;
+    if (!el) return;
+
+    const handleFocusOut = (): void => {
+      window.setTimeout(() => {
+        if (selectedLabel.current) return;
+        const text = (inputEl.current?.value ?? '').trim();
+        if (!text) return;
+
+        const matches = filteredUsersRef.current;
+        if (matches.length > 0) {
+          const first = matches[0];
+          if (inputEl.current) inputEl.current.value = first.label;
+          selectUser(first.value, first.label);
+        } else {
+          if (inputEl.current) inputEl.current.value = '';
+          selectUser(undefined, undefined);
+        }
+      }, 150);
+    };
+
+    el.addEventListener('focusout', handleFocusOut);
+    return () => el.removeEventListener('focusout', handleFocusOut);
   }, []);
 
   const fetchUserData = (): void => {
@@ -57,14 +94,14 @@ const WeUserAutocomplete: React.FC<AdminUserAutocompleteProps> = props => {
         onSuggestionItemSelect={(
           event: Ui5CustomEvent<InputDomRef, InputSuggestionItemSelectEventDetail>
         ) => {
-          if (props.onSelectUser && event.detail.item.dataset.value) {
-            props.onSelectUser(event.detail.item.dataset.value, event.detail.item.text);
+          if (event.detail.item.dataset.value) {
+            selectUser(event.detail.item.dataset.value, event.detail.item.text);
           }
         }}
         onInput={() => {
           fetchUserData();
-          if (props.onSelectUser) {
-            props.onSelectUser(undefined, undefined);
+          if ((inputEl.current?.value ?? '') !== selectedLabel.current) {
+            selectUser(undefined, undefined);
           }
         }}>
         {filteredUsers.map(user => {
