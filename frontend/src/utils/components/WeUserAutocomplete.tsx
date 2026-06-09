@@ -52,6 +52,7 @@ const WeUserAutocomplete: React.FC<AdminUserAutocompleteProps> = props => {
         placeholder={t('common.actions.searchUser')}
         value={props.initialLabel ?? ''}
         showSuggestions
+        noTypeahead
         showClearIcon
         onSuggestionItemSelect={(
           event: Ui5CustomEvent<InputDomRef, InputSuggestionItemSelectEventDetail>
