@@ -7,8 +7,8 @@ from typing import Any, List, Literal
 
 import sqlalchemy.dialects.mysql as myty
 import sqlalchemy.types as ty
-from sqlalchemy import CheckConstraint, Computed, ForeignKey, Index, UniqueConstraint, and_, null, or_, select, true
-from sqlalchemy.orm import Mapped, column_property, declared_attr, deferred, mapped_column, relationship, validates
+from sqlalchemy import CheckConstraint, Computed, ForeignKey, Index, UniqueConstraint, and_, event, func, null, or_, select, true
+from sqlalchemy.orm import Mapped, Session, column_property, declared_attr, deferred, mapped_column, relationship, validates
 from sqlalchemy_file import File, FileField
 
 from actidoo_wfe.database import Base, FlexibleUuid, JSONBlob, UTCDateTime, ZlibJSONBlob
@@ -68,7 +68,7 @@ class WorkflowUser(Base):
         if value is None:
             return None
 
-        keys = {l["key"] for l in get_supported_locales()}
+        keys = {loc["key"] for loc in get_supported_locales()}
 
         if value not in keys:
             raise ValueError(f"Unsupported locale: {value}")
@@ -628,7 +628,7 @@ class WorkflowTimeEvent(Base):
     )
 
 
-#### Extension model base + WorkflowManagedMixin (for data models) ####
+#### Extension model base + data-model mixins (DataModelMixin / VersionedMixin) ####
 
 
 def extension_model_base(namespace: str) -> type:
@@ -660,39 +660,117 @@ def extension_model_base(namespace: str) -> type:
     return _ExtBase
 
 
+# System columns hidden from the default (inferred) field projection — pure
+# plumbing, not display fields. The stable ``id`` and the record ``title`` stay
+# out of this set so they are projectable and searchable; ``serialize_row``
+# always carries them (and ``version``) for the client.
 _MIXIN_SYSTEM_COLUMNS = frozenset(
     {
-        "parent_workflow_instance_id",
-        "child_workflow_instance_id",
+        "version",
+        "is_current",
+        "workflow_instance_id",
         "action",
+        "created_at",
     }
 )
 
 
-class WorkflowManagedMixin:
-    """Mixin for data managed exclusively by workflows.
+class DataModelMixin:
+    """Base mixin for every data model exposed via the data API.
 
-    Each modification creates a new row linked to the previous one,
-    forming a version chain via parent/child workflow instance IDs.
+    Gives the model a stable surrogate ``id`` — its own identity, independent of
+    any workflow — and a reserved, human-readable ``title``. Writers set the
+    title like any business column; the data API always projects it into the row
+    data and includes it in the global search, so every record has a speakable,
+    findable name. Non-versioned models (e.g. config / lookup tables) use this
+    directly: one row per ``id``, which is the sole primary key.
     """
 
-    workflow_instance_id: Mapped[uuid.UUID] = mapped_column(
+    id: Mapped[uuid.UUID] = mapped_column(
         FlexibleUuid,
         primary_key=True,
+        default=uuid.uuid4,
+        sort_order=-100,  # keep id first; composite-PK order across mixins needs explicit sort_order
     )
-    parent_workflow_instance_id: Mapped[uuid.UUID | None] = mapped_column(
+    # Reserved record title — a model declaring its own ``title`` column would
+    # silently shadow this one, so registration rejects that (registry gate keys
+    # on the ``info`` marker below).
+    title: Mapped[str | None] = mapped_column(
+        ty.String(200),
+        nullable=True,
+        sort_order=-94,  # behind the VersionedMixin columns; PK order (id, version) stays untouched
+        info={"wfe_reserved_title": True},
+    )
+
+
+class VersionedMixin(DataModelMixin):
+    """Opt-in versioning on top of ``DataModelMixin``.
+
+    Each modification appends a new row that shares the record's stable ``id`` and
+    bumps ``version`` (counted per ``id``); the current row carries ``is_current``.
+    The primary key is the composite ``(id, version)``. ``workflow_instance_id`` is
+    provenance only (which workflow instance produced this version) — not identity.
+    """
+
+    version: Mapped[int] = mapped_column(
+        ty.Integer,
+        primary_key=True,
+        default=1,
+        sort_order=-99,
+    )
+    is_current: Mapped[bool] = mapped_column(
+        ty.Boolean,
+        nullable=False,
+        default=True,
+        index=True,
+        sort_order=-98,
+    )
+    # Provenance: which workflow instance produced THIS version (not the identity).
+    workflow_instance_id: Mapped[uuid.UUID | None] = mapped_column(
         FlexibleUuid,
         nullable=True,
-    )
-    child_workflow_instance_id: Mapped[uuid.UUID | None] = mapped_column(
-        FlexibleUuid,
-        nullable=True,
+        sort_order=-97,
     )
     action: Mapped[str | None] = mapped_column(
         ty.String(100),
         nullable=True,
+        sort_order=-96,
     )
     created_at: Mapped[datetime.datetime | None] = mapped_column(
         ty.DateTime,
         nullable=True,
+        default=dt_now_naive,
+        sort_order=-95,
     )
+
+
+# Back-compat alias: "workflow-managed" == versioned + written only by workflows.
+WorkflowManagedMixin = VersionedMixin
+
+
+@event.listens_for(Session, "before_flush")
+def _assign_versions(session: Session, flush_context, instances) -> None:
+    """Maintain ``version``/``is_current`` for newly added versioned rows.
+
+    A service task writes plain ORM — ``db.add(Model(**fields))`` for a new record
+    (a fresh ``id`` is defaulted) or ``db.add(Model(id=record_id, **fields))`` to
+    append a version. This hook then assigns ``version`` (1, or ``max+1`` for an
+    existing id) and ``is_current=True``, demoting the previous head. It only acts
+    when ``version`` is left unset, so tests that seed explicit version rows are
+    untouched. ``id``/``created_at`` come from column defaults; provenance
+    (``workflow_instance_id``) and ``action`` stay caller-set.
+    """
+    for obj in list(session.new):
+        if not isinstance(obj, VersionedMixin) or obj.version is not None:
+            continue
+        model_class = type(obj)
+        with session.no_autoflush:
+            existing_max = session.scalar(select(func.max(model_class.version)).where(model_class.id == obj.id))
+            if existing_max is not None:
+                current_head = session.scalar(
+                    select(model_class).where(model_class.id == obj.id, model_class.is_current.is_(True))
+                )
+                if current_head is not None and current_head is not obj:
+                    current_head.is_current = False
+        obj.version = existing_max + 1 if existing_max is not None else 1
+        obj.is_current = True

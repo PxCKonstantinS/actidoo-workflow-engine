@@ -13,7 +13,7 @@ import {
 import moment from 'moment';
 import { useDispatch, useSelector } from 'react-redux';
 import { useParams, useBlocker } from 'react-router-dom';
-import { PcPage } from '@/ui5-components';
+import { PcDynamicPage } from '@/ui5-components';
 import { WeDataKey } from '@/store/generic-data/setup';
 import { postRequest } from '@/store/generic-data/actions';
 import { State } from '@/store';
@@ -413,8 +413,10 @@ const AdminUserDetails: React.FC = () => {
   const isLoading = loadingDetail && !userDetail;
 
   return (
-    <PcPage
-      header={{ title: t('adminUserDetails.pageTitle', { name: pageTitle }), showBack: true }}>
+    <PcDynamicPage
+      header={{ title: t('adminUserDetails.pageTitle', { name: pageTitle }), showBack: true }}
+      showHideHeaderButton={false}
+      headerContentPinnable={false}>
       {isLoading ? (
         <div className="flex justify-center py-12">
           <BusyIndicator active size="Large" />
@@ -431,7 +433,7 @@ const AdminUserDetails: React.FC = () => {
         </div>
       )}
       {renderUnsavedChangesDialog()}
-    </PcPage>
+    </PcDynamicPage>
   );
 };
 

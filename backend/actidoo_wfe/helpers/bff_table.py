@@ -7,11 +7,15 @@ import logging
 import uuid
 from collections.abc import Iterable
 from enum import Enum
+from functools import lru_cache
 from typing import Annotated, Any, List, Optional
 
 import pydantic.v1
 from dateutil import parser
-from fastapi import Query
+from fastapi import Query, Request
+from fastapi.dependencies.models import Dependant
+from fastapi.dependencies.utils import get_dependant, request_params_to_args
+from fastapi.exceptions import RequestValidationError
 from sqlalchemy import ScalarResult, Select, and_, func, or_, select
 from sqlalchemy.orm import Session
 
@@ -493,6 +497,16 @@ class BFFTable:
         items = list(self._get_scalars().all())
         return self._make_result(items, self._get_count() or 0)
 
+    def get_all_data(self) -> list:
+        """Every row matching the prepared query — filters, search and sorting
+        applied, deliberately WITHOUT limit/offset. For exports of the full
+        filtered view.
+
+        Pagination params that may be present in the request are ignored on
+        purpose, so an export can never silently truncate to a page.
+        """
+        return list(self.db.execute(self.query).scalars().all())
+
 
 class CursorBFFTable(BFFTable):
     """Keyset (cursor) pagination variant of :class:`BFFTable`.
@@ -605,6 +619,34 @@ def get_bff_table_query_schema(
 
     # model = create_model()
     return model
+
+
+@lru_cache(maxsize=256)
+def _dependant_for(schema_cls: type[BffTableQuerySchemaBase]) -> Dependant:
+    """FastAPI's introspection of a schema class, cached per class (by identity).
+
+    Bounded so callers that pass throwaway classes cannot grow it unboundedly.
+    """
+    return get_dependant(path="", call=schema_cls)
+
+
+def parse_bff_table_query_params(schema_cls: type[BffTableQuerySchemaBase], request: Request) -> BffTableQuerySchemaBase:
+    """Bind and validate a request's query params against a table-query schema.
+
+    The manual counterpart of declaring ``Depends(schema_cls)`` on a route, for
+    schemas that are built dynamically (e.g. per data model) and therefore cannot
+    appear in a route signature. Binding reuses FastAPI's own query-parameter
+    machinery, so invalid parameters produce FastAPI's standard structured 422
+    body and unknown query params are ignored — exactly like on static routes.
+    The introspection of ``schema_cls`` is cached; only the binding runs per call.
+
+    ``get_dependant``/``request_params_to_args`` are not public FastAPI API; the
+    422 test on the workflow-data list route guards this against upgrades.
+    """
+    values, errors = request_params_to_args(_dependant_for(schema_cls).query_params, request.query_params)
+    if errors:
+        raise RequestValidationError(errors)
+    return schema_cls(**values)
 
 
 def get_min_max(val, maxv=100, minv=1, default=100):

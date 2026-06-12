@@ -70,8 +70,19 @@ from actidoo_wfe.wf.types import (
 log = logging.getLogger(__name__)
 
 
-def start_workflow(db: Session, name: str, user_id: uuid.UUID, initial_task_data: dict | None = None) -> uuid.UUID:
-    """Starts a workflow with the given name, and the given user as creator. Returns the workflow ID."""
+def start_workflow(
+    db: Session,
+    name: str,
+    user_id: uuid.UUID,
+    initial_task_data: dict | None = None,
+    preserve_initial_unknown_fields: bool = False,
+) -> uuid.UUID:
+    """Starts a workflow with the given name, and the given user as creator. Returns the workflow ID.
+
+    ``preserve_initial_unknown_fields`` keeps technical fields of ``initial_task_data``
+    that are not part of the first user task's form. Only pass ``True`` for a trusted,
+    server-built seed — never for client-supplied data.
+    """
     user_rep = repository.load_user(db=db, user_id=user_id)
     repository.persist_workflow_spec(db=db, name=name)
 
@@ -101,6 +112,7 @@ def start_workflow(db: Session, name: str, user_id: uuid.UUID, initial_task_data
                 workflow=workflow,
                 task=first_task,
                 submitted_data=initial_task_data,
+                preserve_unknown_fields=preserve_initial_unknown_fields,
             )
             service_workflow.update_task_data(
                 workflow=workflow,
@@ -579,12 +591,17 @@ def get_usertasks_for_user_id(
     return usertasks
 
 
-def _clean_submitted_task_data(workflow, task, submitted_data):
+def _clean_submitted_task_data(workflow, task, submitted_data, preserve_unknown_fields: bool = False):
     """Validate and clean a payload from a user form submission.
 
     The payload typically only contains the fields the frontend knows about.
     Unknown / technical properties are removed deliberately and hidden fields
-    are stripped."""
+    are stripped.
+
+    ``preserve_unknown_fields`` keeps technical fields that are not part of the
+    form. It must stay ``False`` for untrusted user submissions; only a trusted,
+    server-built seed (e.g. a data-model action payload) may set it to carry a
+    technical variable through a user task that has no field for it."""
 
     assert task.uischema and task.jsonschema
     form = ReactJsonSchemaFormData(jsonschema=task.jsonschema, uischema=task.uischema)
@@ -604,7 +621,7 @@ def _clean_submitted_task_data(workflow, task, submitted_data):
         task_data=submitted_data,
         options_folder=options_folder,
         functions_env=functions_env,
-        preserve_unknown_fields=False,
+        preserve_unknown_fields=preserve_unknown_fields,
         preserve_disabled_fields=False,
     )
 

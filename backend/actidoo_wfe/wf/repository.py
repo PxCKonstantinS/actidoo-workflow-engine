@@ -424,10 +424,17 @@ def persist_workflow_spec(db: Session, name: str):
             db.add(db_file)
 
 
-def load_user(db: Session, user_id: uuid.UUID) -> UserRepresentation:
-    user = db.execute(
+def load_workflow_user(db: Session, user_id: uuid.UUID) -> WorkflowUser:
+    """Load the ORM user. Most callers want ``load_user`` (the representation);
+    the workflow-data service passes the ORM object into ``row_filter`` extension
+    callbacks, which rely on its relationships."""
+    return db.execute(
         select(WorkflowUser).where(WorkflowUser.id == user_id),
     ).scalar_one()
+
+
+def load_user(db: Session, user_id: uuid.UUID) -> UserRepresentation:
+    user = load_workflow_user(db, user_id)
     roles = {r.role.name for r in user.roles}
     claims = {claim.claim_key: claim.claim_value for claim in user.claims}
 
