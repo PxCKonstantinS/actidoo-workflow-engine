@@ -23,7 +23,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from actidoo_wfe.database import FlexibleUuid, SessionLocal, SessionMaker, get_db_contextmanager, setup_db
 from actidoo_wfe.settings import settings
-from actidoo_wfe.wf import service_user
+from actidoo_wfe.wf import repository, service_user
 from actidoo_wfe.wf.config_data_model import (
     READ_ALL_WORKFLOW_USERS,
     ActionDef,
@@ -31,7 +31,7 @@ from actidoo_wfe.wf.config_data_model import (
     WorkflowDataApiConfig,
     add_workflow_participant_filter,
 )
-from actidoo_wfe.wf.models import VersionedMixin, WorkflowInstance, extension_model_base
+from actidoo_wfe.wf.models import DataModelFile, WorkflowInstance, WorkflowManagedMixin, extension_model_base
 from actidoo_wfe.wf.registry_data_model import DataModelDescriptor, data_model_registry
 from actidoo_wfe.wf.tests.helpers.client import Client
 from actidoo_wfe.wf.tests.helpers.overrides import disable_role_check, override_get_user
@@ -51,12 +51,14 @@ def _wf_id(label: str) -> str:
 _ApiTestBase = extension_model_base("apitest")
 
 
-class ApiTestModel(_ApiTestBase, VersionedMixin):
+class ApiTestModel(_ApiTestBase, WorkflowManagedMixin):
     _ext_table = "ate"
     __abstract__ = False
     name: Mapped[str | None] = mapped_column(String(100), nullable=True)
     value: Mapped[int | None] = mapped_column(nullable=True)
-    data_upload: Mapped[str | None] = mapped_column(String(1000), nullable=True)
+    # ``data_upload`` is a framework-managed file field (registered with
+    # type="file"); its references live in the data_model_files side table, not a
+    # column. Tests seed them via ``_seed_file``.
 
 
 @pytest.fixture(autouse=True)
@@ -125,19 +127,42 @@ def _register_non_api(name):
     )
 
 
-def _seed_row(row_id, *, name="Row", value=1, data_upload=None, version=1, is_current=True, workflow_instance_id=None, title=None):
+def _seed_row(row_id, *, name="Row", value=1, version=1, is_current=True, workflow_instance_id=None, title=None):
     """Seed an ApiTestModel version row. ``version``/``is_current`` are set explicitly
-    so the ``before_flush`` versioning hook leaves the seeded values untouched."""
+    so the ``before_flush`` versioning hook leaves the seeded values untouched.
+    ``workflow_instance_id`` is mandatory (WorkflowManagedMixin) — a fresh provenance
+    id is generated when the caller does not pin one."""
     with SessionMaker() as db, db.begin():
         db.add(ApiTestModel(
             id=row_id,
             version=version,
             is_current=is_current,
-            workflow_instance_id=workflow_instance_id,  # provenance, distinct from id
-            title=title,  # reserved record title from DataModelMixin
+            workflow_instance_id=workflow_instance_id or uuid.uuid4(),  # provenance, distinct from id
+            title=title,  # reserved record title from WorkflowManagedMixin
             name=name,
             value=value,
-            data_upload=data_upload,
+        ))
+
+
+def _store_attachment(file_hash, *, filename="doc.pdf", mimetype="application/pdf", content=b"BYTES"):
+    """Create a real WorkflowAttachment (stored via the tmp file storage fixture)."""
+    with SessionMaker() as db, db.begin():
+        att = repository.store_attachment(db=db, filename=filename, mimetype=mimetype, data=content, hash=file_hash)
+        return att.id
+
+
+def _seed_file(row_id, attachment_id, *, model_name="Files", row_version=1, field_name="data_upload", filename="doc.pdf", mimetype="application/pdf", position=0):
+    """Seed a data_model_files side row linking a row version to an attachment."""
+    with SessionMaker() as db, db.begin():
+        db.add(DataModelFile(
+            model_name=model_name,
+            row_id=row_id,
+            row_version=row_version,
+            field_name=field_name,
+            workflow_attachment_id=attachment_id,
+            filename=filename,
+            mimetype=mimetype,
+            position=position,
         ))
 
 
@@ -186,21 +211,6 @@ class TestDisplayTypeInference:
         from actidoo_wfe.wf import views_data_model
 
         assert views_data_model.display_type(col_type) == expected
-
-
-class TestFileRefParsing:
-    def test_parses_array_object_and_handles_garbage(self):
-        from actidoo_wfe.wf import views_data_model
-
-        one = '{"id": "a", "hash": "h", "filename": "f.pdf", "mimetype": "application/pdf"}'
-        assert views_data_model._parse_file_refs(one) == [
-            {"id": "a", "hash": "h", "filename": "f.pdf", "mimetype": "application/pdf"},
-        ]
-        arr = '[{"id": "a", "filename": "f"}, {"id": "b", "filename": "g"}]'
-        assert [r["id"] for r in views_data_model._parse_file_refs(arr)] == ["a", "b"]
-        assert views_data_model._parse_file_refs("") == []
-        assert views_data_model._parse_file_refs("not-json") == []
-        assert views_data_model._parse_file_refs(None) == []
 
 
 # ---------------------------------------------------------------------------
@@ -295,7 +305,9 @@ class TestListModelsEndpoint:
                 model = _list_models(client).json()[0]
 
             file_field = next(f for f in model["fields"] if f["name"] == "data_upload")
-            assert file_field["filterable"] is False and file_field["sortable"] is True
+            # File fields are framework-managed virtual fields (no backing column).
+            assert file_field["filterable"] is False and file_field["sortable"] is False
+            assert file_field["virtual"] is True and file_field["type"] == "file"
 
     def test_respects_explicit_fields_config_with_computed_field(self, db_engine_ctx):
         with db_engine_ctx():
@@ -471,8 +483,10 @@ class TestListRowsEndpoint:
             db = SessionLocal()
             dummy = WorkflowDummy(db_session=db, users_with_roles={"u": ["wf-user"]})
             _register("Files", fields=[FieldDef("name"), FieldDef("data_upload", type="file")])
-            payload = '[{"id": "1", "hash": "h1", "filename": "a.pdf", "mimetype": "application/pdf"}]'
-            _seed_row(_wf_id("wf-file"), name="WithFile", data_upload=payload)
+            row_id = _wf_id("wf-file")
+            _seed_row(row_id, name="WithFile")
+            att_id = _store_attachment("h1", filename="a.pdf", mimetype="application/pdf")
+            _seed_file(row_id, att_id, filename="a.pdf", mimetype="application/pdf")
 
             client = Client()
             with override_get_user(client=client, user=dummy.user("u").user), disable_role_check(client):
@@ -481,7 +495,7 @@ class TestListRowsEndpoint:
             assert response.status_code == 200
             item = response.json()["ITEMS"][0]["data"]
             assert item["data_upload"] == [
-                {"id": "1", "hash": "h1", "filename": "a.pdf", "mimetype": "application/pdf"},
+                {"id": str(att_id), "hash": "h1", "filename": "a.pdf", "mimetype": "application/pdf"},
             ]
 
     def test_filter_and_sort_via_bff_table(self, db_engine_ctx):
@@ -854,20 +868,7 @@ class TestAttachmentDownload:
             f"{_models_base(client)}/{model_name}/{record_id}/versions/{version}/attachments/{file_hash}"
         )
 
-    def _patch_attachment(self, monkeypatch, *, file_hash, filename="doc.pdf", content=b"BYTES"):
-        from types import SimpleNamespace
-
-        import actidoo_wfe.wf.repository as repository
-        import actidoo_wfe.wf.service_data_model as service_data_model
-
-        att = SimpleNamespace(
-            id=uuid.uuid4(), hash=file_hash, first_filename=filename,
-            mimetype="application/pdf", file=SimpleNamespace(file_id="fid"),
-        )
-        monkeypatch.setattr(repository, "find_attachment_by_hash", lambda db, h: att if h == file_hash else None)
-        monkeypatch.setattr(service_data_model, "get_file_content", lambda file_id: content)
-
-    def test_happy_path_streams_attachment(self, db_engine_ctx, monkeypatch):
+    def test_happy_path_streams_attachment(self, db_engine_ctx):
         with db_engine_ctx():
             _create_extension_table()
             db = SessionLocal()
@@ -875,10 +876,9 @@ class TestAttachmentDownload:
             file_hash = "hash-abc"
             _register("Files", fields=[FieldDef("name"), FieldDef("data_upload", type="file")])
             row_id = _wf_id("f1")
-            _seed_row(row_id, name="R", data_upload=(
-                f'[{{"id": "1", "hash": "{file_hash}", "filename": "doc.pdf", "mimetype": "application/pdf"}}]'
-            ))
-            self._patch_attachment(monkeypatch, file_hash=file_hash, content=b"PDFDATA")
+            _seed_row(row_id, name="R")
+            att_id = _store_attachment(file_hash, filename="doc.pdf", content=b"PDFDATA")
+            _seed_file(row_id, att_id, filename="doc.pdf")
 
             client = Client()
             with override_get_user(client=client, user=dummy.user("u").user), disable_role_check(client):
@@ -888,16 +888,44 @@ class TestAttachmentDownload:
             assert resp.content == b"PDFDATA"
             assert "doc.pdf" in resp.headers.get("content-disposition", "")
 
-    def test_ownership_unreferenced_hash_returns_404(self, db_engine_ctx, monkeypatch):
+    def test_serves_per_row_filename_under_hash_dedup(self, db_engine_ctx):
+        """The download name is the row's context filename, not the attachment's
+        first_filename (which, under hash dedup, is the first uploader's name)."""
+        with db_engine_ctx():
+            _create_extension_table()
+            db = SessionLocal()
+            dummy = WorkflowDummy(db_session=db, users_with_roles={"u": ["wf-user"]})
+            file_hash = "shared-bytes"
+            _register("Files", fields=[FieldDef("name"), FieldDef("data_upload", type="file")])
+            # One attachment (first_filename "first.pdf"), referenced by two rows
+            # under different context names.
+            att_id = _store_attachment(file_hash, filename="first.pdf", content=b"DATA")
+            row_a, row_b = _wf_id("fa"), _wf_id("fb")
+            _seed_row(row_a, name="A")
+            _seed_row(row_b, name="B")
+            _seed_file(row_a, att_id, filename="invoice-a.pdf")
+            _seed_file(row_b, att_id, filename="invoice-b.pdf")
+
+            client = Client()
+            with override_get_user(client=client, user=dummy.user("u").user), disable_role_check(client):
+                resp_a = self._download(client, "Files", row_a, 1, file_hash)
+                resp_b = self._download(client, "Files", row_b, 1, file_hash)
+
+            assert "invoice-a.pdf" in resp_a.headers.get("content-disposition", "")
+            assert "invoice-b.pdf" in resp_b.headers.get("content-disposition", "")
+
+    def test_ownership_unreferenced_hash_returns_404(self, db_engine_ctx):
         with db_engine_ctx():
             _create_extension_table()
             db = SessionLocal()
             dummy = WorkflowDummy(db_session=db, users_with_roles={"u": ["wf-user"]})
             _register("Files", fields=[FieldDef("name"), FieldDef("data_upload", type="file")])
             row_id = _wf_id("f2")
-            _seed_row(row_id, name="R", data_upload='[{"id": "1", "hash": "referenced", "filename": "a"}]')
-            # The attachment exists globally, but the row does not reference this hash.
-            self._patch_attachment(monkeypatch, file_hash="other-hash")
+            _seed_row(row_id, name="R")
+            att_id = _store_attachment("referenced", filename="a.pdf")
+            _seed_file(row_id, att_id, filename="a.pdf")
+            # An unrelated attachment exists globally, but the row does not reference it.
+            _store_attachment("other-hash", filename="b.pdf")
 
             client = Client()
             with override_get_user(client=client, user=dummy.user("u").user), disable_role_check(client):
@@ -911,7 +939,9 @@ class TestAttachmentDownload:
             user = _make_detached_user("dl3", "dl3@example.com", role_name="viewer")
             _register("Files", read_roles=["admin"], fields=[FieldDef("data_upload", type="file")])
             row_id = _wf_id("f3")
-            _seed_row(row_id, name="R", data_upload='[{"hash": "h"}]')
+            _seed_row(row_id, name="R")
+            att_id = _store_attachment("h", filename="a.pdf")
+            _seed_file(row_id, att_id, filename="a.pdf")
 
             client = Client()
             with override_get_user(client=client, user=user), disable_role_check(client):
@@ -930,7 +960,9 @@ class TestAttachmentDownload:
 
             _register("Files", fields=[FieldDef("data_upload", type="file")], row_filter=hide_all)
             row_id = _wf_id("f4")
-            _seed_row(row_id, name="R", value=1, data_upload='[{"hash": "h"}]')
+            _seed_row(row_id, name="R", value=1)
+            att_id = _store_attachment("h", filename="a.pdf")
+            _seed_file(row_id, att_id, filename="a.pdf")
 
             client = Client()
             with override_get_user(client=client, user=dummy.user("u").user), disable_role_check(client):

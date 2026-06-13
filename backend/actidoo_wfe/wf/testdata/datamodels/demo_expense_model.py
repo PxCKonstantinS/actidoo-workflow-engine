@@ -23,21 +23,23 @@ from actidoo_wfe.wf.config_data_model import (
     WorkflowDataApiConfig,
     requires_role,
 )
-from actidoo_wfe.wf.models import VersionedMixin, extension_model_base
+from actidoo_wfe.wf.models import WorkflowManagedMixin, extension_model_base
 from actidoo_wfe.wf.registry_data_model import register_data_model
 
 DemoBase = extension_model_base("demo")
 
 
-class DemoExpense(DemoBase, VersionedMixin):
+class DemoExpense(DemoBase, WorkflowManagedMixin):
     _ext_table = "expense"  # -> __tablename__ = "ext_demo_expense"
 
-    # ``title`` comes from DataModelMixin (reserved record title) — declaring an
-    # own column here would shadow it and fail at registration.
+    # ``title`` comes from WorkflowManagedMixin (reserved record title) — declaring
+    # an own column here would shadow it and fail at registration. The mixin also
+    # gives the mandatory ``workflow_instance_id`` provenance, set by the service tasks.
     amount: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
     category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     status: Mapped[str | None] = mapped_column(String(50), nullable=True)
-    receipt: Mapped[str | None] = mapped_column(String(1000), nullable=True)  # JSON file refs
+    # ``receipt`` is a framework-managed file field (FieldDef type="file" below):
+    # its references live in the data_model_files side table, not in a column.
 
 
 def _editable_rows(query, db, user):

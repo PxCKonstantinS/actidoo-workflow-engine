@@ -188,7 +188,7 @@ def get_version_chain(
     # The follow-up workflows startable on the current (head) version — the detail
     # page offers them like the table does per row.
     head_actions = views_data_model.actions_by_row(data_model, [head], db, user).get(head.id, [])
-    return views_data_model.version_chain_response(data_model, chain, head_actions, locale=user.locale)
+    return views_data_model.version_chain_response(data_model, chain, head_actions, db=db, locale=user.locale)
 
 
 def export_rows_csv(
@@ -207,7 +207,7 @@ def export_rows_csv(
     """
     user = _require_read_access(db, user_id, data_model)
     rows = views_data_model.all_rows(data_model, db, user, request_params=request_params)
-    return views_data_model.rows_to_csv(data_model, rows, locale=user.locale), f"{data_model.name}.csv"
+    return views_data_model.rows_to_csv(data_model, rows, db=db, locale=user.locale), f"{data_model.name}.csv"
 
 
 # ---------------------------------------------------------------------------
@@ -292,21 +292,21 @@ def load_row_attachment(
     user = _require_read_access(db, user_id, data_model)
 
     row = _load_version_row(db, user, data_model, row_id, version)
+    row_version = getattr(row, "version", 0) or 0
 
-    # Ownership: the hash must be referenced by a file field of this very row.
-    if file_hash not in views_data_model.row_file_hashes(row, data_model):
-        raise DataModelRowNotFoundError("Attachment not found")
-
-    attachment = repository.find_attachment_by_hash(db, file_hash)
-    if attachment is None or attachment.file is None:
+    # Ownership + filename come from the side table: a file row for this exact
+    # version must reference the hash. The per-row filename names the download in
+    # this record's context (the deduped attachment's first_filename may differ).
+    side = repository.find_data_model_file_by_hash(db, data_model.name, row.id, row_version, file_hash)
+    if side is None or side.attachment.file is None:
         raise DataModelRowNotFoundError("Attachment not found")
 
     return Attachment(
-        id=attachment.id,
-        hash=attachment.hash,
-        filename=attachment.first_filename,
-        mimetype=attachment.mimetype,
-        data=get_file_content(attachment.file.file_id),
+        id=side.attachment.id,
+        hash=side.attachment.hash,
+        filename=side.filename,
+        mimetype=side.mimetype or side.attachment.mimetype,
+        data=get_file_content(side.attachment.file.file_id),
     )
 
 

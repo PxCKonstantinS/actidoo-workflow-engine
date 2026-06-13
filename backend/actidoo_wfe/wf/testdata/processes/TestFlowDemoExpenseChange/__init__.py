@@ -11,8 +11,6 @@ record (``action="UPDATE"``); the ``before_flush`` versioning hook bumps
 ``version`` and demotes the previous head.
 """
 
-from sqlalchemy import select
-
 from actidoo_wfe.wf.service_task_helper import ServiceTaskHelper
 
 DATA_MODELS = ["DemoExpense"]
@@ -23,13 +21,13 @@ def service_demo_persist_update(sth: ServiceTaskHelper):
 
     ``source_id`` is the stable record id, a server-set technical variable carried
     by the engine (not a form field), so it is trusted here — the client picks the
-    row at action start, never re-supplies it. The receipt is not re-entered in the
-    edit form, so it is carried forward from the current version. Adding a row with
-    the existing ``id`` lets the versioning hook do the rest.
+    row at action start, never re-supplies it. Adding a row with the existing ``id``
+    lets the versioning hook do the rest. The ``receipt`` file field is not
+    re-entered in the edit form, so the framework auto-copies it forward from the
+    previous version (call ``sth.clear_files(row, "receipt")`` to drop it instead).
     """
     DemoExpense = sth.get_model("DemoExpense")
     source_id = sth.task_data.get("source_id")
-    current = sth.db.scalar(select(DemoExpense).where(DemoExpense.id == source_id, DemoExpense.is_current.is_(True)))
     sth.db.add(
         DemoExpense(
             id=source_id,
@@ -39,7 +37,6 @@ def service_demo_persist_update(sth: ServiceTaskHelper):
             amount=sth.task_data.get("amount"),
             category=sth.task_data.get("category"),
             status="open",
-            receipt=current.receipt if current is not None else None,
         )
     )
     sth.db.flush()

@@ -13,7 +13,7 @@ from sqlalchemy.orm import Mapped, mapped_column
 from actidoo_wfe.database import Base
 from actidoo_wfe.wf.config_data_model import WorkflowDataApiConfig
 from actidoo_wfe.wf.exceptions import DataModelAccessDeniedError, DataModelNotFoundError
-from actidoo_wfe.wf.models import DataModelMixin, VersionedMixin, extension_model_base
+from actidoo_wfe.wf.models import DataModelMixin, VersionedMixin, WorkflowManagedMixin, extension_model_base
 from actidoo_wfe.wf.registry_data_model import (
     DataModelDescriptor,
     data_model_registry,
@@ -71,7 +71,7 @@ class TestExtensionModelBase:
 
 
 class TestIdentityMixins:
-    def test_versioned_mixin_columns_present(self):
+    def test_versioned_mixin_columns_are_pure_versioning(self):
         TestModel = extension_model_base("mixin_test")
 
         class MixinModel(TestModel, VersionedMixin):
@@ -79,10 +79,22 @@ class TestIdentityMixins:
             __abstract__ = False
 
         col_names = {col.key for col in sa_inspect(MixinModel).columns}
-        assert {"id", "title", "version", "is_current", "workflow_instance_id", "action", "created_at"} <= col_names
-        # parent/child pointers are gone (replaced by id + version).
-        assert "parent_workflow_instance_id" not in col_names
-        assert "child_workflow_instance_id" not in col_names
+        assert {"id", "version", "is_current", "created_at"} <= col_names
+        # Provenance, action and title belong to WorkflowManagedMixin, not plain versioning.
+        assert {"workflow_instance_id", "action", "title"}.isdisjoint(col_names)
+
+    def test_workflow_managed_mixin_columns_present(self):
+        TestModel = extension_model_base("wmm_cols")
+
+        class WmmModel(TestModel, WorkflowManagedMixin):
+            _ext_table = "wmc"
+            __abstract__ = False
+
+        cols = {col.key: col for col in sa_inspect(WmmModel).columns}
+        assert {"id", "version", "is_current", "created_at", "workflow_instance_id", "action", "title"} <= set(cols)
+        # Provenance is mandatory; title is reserved but nullable.
+        assert cols["workflow_instance_id"].nullable is False
+        assert cols["title"].nullable is True and cols["title"].info.get("wfe_reserved_title")
 
     def test_versioned_pk_is_id_and_version(self):
         TestModel = extension_model_base("mixin_pk")
@@ -103,8 +115,9 @@ class TestIdentityMixins:
 
         pk_names = [col.key for col in sa_inspect(IdOnlyModel).primary_key]
         assert pk_names == ["id"]
-        # The reserved record title is part of the base mixin, not just versioning.
-        assert "title" in {col.key for col in sa_inspect(IdOnlyModel).columns}
+        # The base mixin carries no title — a human-readable name is part of the
+        # workflow-managed contract, not every model.
+        assert "title" not in {col.key for col in sa_inspect(IdOnlyModel).columns}
         # A bare DataModelMixin is not versioned.
         assert not issubclass(IdOnlyModel, VersionedMixin)
 
@@ -200,11 +213,11 @@ class TestRegisterDataModelDecorator:
         assert "DecTestModel" in data_model_registry.list_names()
 
     def test_decorator_with_api_config_requires_mixin(self):
-        """api config without DataModelMixin raises TypeError."""
+        """api config without WorkflowManagedMixin raises TypeError."""
         TestModel = extension_model_base("dec_api_test")
         api_cfg = WorkflowDataApiConfig(read_roles=["viewer"])
 
-        with pytest.raises(TypeError, match="DataModelMixin"):
+        with pytest.raises(TypeError, match="WorkflowManagedMixin"):
 
             @register_data_model(name="BadApiModel", api=api_cfg)
             class BadApiModel(TestModel):
@@ -212,13 +225,25 @@ class TestRegisterDataModelDecorator:
                 __abstract__ = False
                 id: Mapped[str] = mapped_column(String(50), primary_key=True)
 
-    def test_decorator_with_versioned_mixin_succeeds(self):
-        """api config with VersionedMixin registers and is marked versioned."""
+    def test_decorator_with_versioned_mixin_rejected_for_api(self):
+        """api requires WorkflowManagedMixin; plain VersionedMixin is not enough."""
+        TestModel = extension_model_base("dec_versioned_api")
+        api_cfg = WorkflowDataApiConfig(read_roles=["viewer"])
+
+        with pytest.raises(TypeError, match="WorkflowManagedMixin"):
+
+            @register_data_model(name="VersionedApiModel", api=api_cfg)
+            class VersionedApiModel(TestModel, VersionedMixin):
+                _ext_table = "vam"
+                __abstract__ = False
+
+    def test_decorator_with_workflow_managed_mixin_succeeds(self):
+        """api config with WorkflowManagedMixin registers and is marked versioned."""
         TestModel = extension_model_base("dec_mixin_test")
         api_cfg = WorkflowDataApiConfig(read_roles=["viewer"])
 
         @register_data_model(name="GoodApiModel", api=api_cfg)
-        class GoodApiModel(TestModel, VersionedMixin):
+        class GoodApiModel(TestModel, WorkflowManagedMixin):
             _ext_table = "gam"
             __abstract__ = False
 
@@ -234,24 +259,22 @@ class TestRegisterDataModelDecorator:
         with pytest.raises(TypeError, match="reserved"):
 
             @register_data_model(name="TitleClash")
-            class TitleClash(TestModel, VersionedMixin):
+            class TitleClash(TestModel, WorkflowManagedMixin):
                 _ext_table = "tcl"
                 __abstract__ = False
                 title: Mapped[str | None] = mapped_column(String(500), nullable=True)
 
-    def test_decorator_with_data_model_mixin_succeeds_non_versioned(self):
-        """A non-versioned DataModelMixin model may be exposed; it is not versioned."""
+    def test_decorator_with_data_model_mixin_rejected_for_api(self):
+        """A non-versioned DataModelMixin model may not be exposed via the API."""
         TestModel = extension_model_base("dec_plain_api")
         api_cfg = WorkflowDataApiConfig(read_roles=["viewer"])
 
-        @register_data_model(name="PlainApiModel", api=api_cfg)
-        class PlainApiModel(TestModel, DataModelMixin):
-            _ext_table = "pam"
-            __abstract__ = False
+        with pytest.raises(TypeError, match="WorkflowManagedMixin"):
 
-        desc = data_model_registry.get("PlainApiModel")
-        assert desc.api is not None
-        assert desc.is_versioned is False
+            @register_data_model(name="PlainApiModel", api=api_cfg)
+            class PlainApiModel(TestModel, DataModelMixin):
+                _ext_table = "pam"
+                __abstract__ = False
 
     def test_decorator_without_api_no_mixin_required(self):
         """No api config — no mixin required."""
@@ -278,7 +301,7 @@ class TestRegisterDataModelDecorator:
         with pytest.raises(ValueError, match="read_roles must not be empty"):
 
             @register_data_model(name="AccidentallyPublic", api=api_cfg)
-            class AccidentallyPublic(TestModel, VersionedMixin):
+            class AccidentallyPublic(TestModel, WorkflowManagedMixin):
                 _ext_table = "apub"
                 __abstract__ = False
 

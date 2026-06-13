@@ -8,8 +8,6 @@ Reference example for the workflow-data feature: a user enters expense data
 a DemoExpense row (``action="CREATE"``).
 """
 
-import json
-
 from actidoo_wfe.wf.service_task_helper import ServiceTaskHelper
 
 DATA_MODELS = ["DemoExpense"]
@@ -21,20 +19,22 @@ def service_demo_persist_create(sth: ServiceTaskHelper):
     Plain ORM: ``id``/``created_at`` come from column defaults and the
     ``before_flush`` versioning hook assigns ``version=1`` / ``is_current=True``.
     Only the provenance (``workflow_instance_id``) and ``action`` are set here.
+    The ``receipt`` is a framework-managed file field: ``attach_files`` records the
+    upload and the framework writes it to the data_model_files side table at flush.
     """
     DemoExpense = sth.get_model("DemoExpense")
-    receipt = sth.task_data.get("receipt")
-    sth.db.add(
-        DemoExpense(
-            workflow_instance_id=sth.workflow_instance_id,
-            action="CREATE",
-            title=sth.task_data.get("title"),
-            amount=sth.task_data.get("amount"),
-            category=sth.task_data.get("category"),
-            status="open",
-            receipt=json.dumps(receipt) if receipt else None,
-        )
+    row = DemoExpense(
+        workflow_instance_id=sth.workflow_instance_id,
+        action="CREATE",
+        title=sth.task_data.get("title"),
+        amount=sth.task_data.get("amount"),
+        category=sth.task_data.get("category"),
+        status="open",
     )
+    sth.db.add(row)
+    receipt = sth.task_data.get("receipt")
+    if receipt:
+        sth.attach_files(row, "receipt", receipt)
     sth.db.flush()
 
 

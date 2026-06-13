@@ -109,42 +109,8 @@ def display_type(col_type) -> DisplayType:
 # ---------------------------------------------------------------------------
 
 
-def _parse_file_refs(value: Any) -> list[dict]:
-    """Parse a ``file`` field's stored JSON metadata into a list of refs.
-
-    The column holds a JSON array or a single JSON object of
-    ``{id, hash, filename, mimetype}``; the actual bytes live in storage. We
-    normalize to a list and stay defensive against malformed JSON.
-    """
-    if value is None or value == "":
-        return []
-    if isinstance(value, str):
-        try:
-            value = json.loads(value)
-        except (ValueError, TypeError):
-            return []
-    if isinstance(value, dict):
-        value = [value]
-    if not isinstance(value, list):
-        return []
-    refs = []
-    for item in value:
-        if isinstance(item, dict):
-            refs.append(
-                {
-                    "id": item.get("id"),
-                    "hash": item.get("hash"),
-                    "filename": item.get("filename"),
-                    "mimetype": item.get("mimetype"),
-                }
-            )
-    return refs
-
-
 def _serialize_value(value: Any, display: DisplayType | None = None) -> Any:
     """Convert a value to a JSON-safe representation for the given display type."""
-    if display == "file":
-        return _parse_file_refs(value)
     if value is None:
         return None
     if isinstance(value, dt.datetime):
@@ -190,8 +156,19 @@ def _safe_compute(field: FieldDef, row: Any) -> Any:
         return None
 
 
-def serialize_row(row: Any, data_model: DataModelDescriptor) -> dict:
-    """Serialize a model instance to a JSON-safe dict, respecting the field config."""
+def serialize_row(
+    row: Any,
+    data_model: DataModelDescriptor,
+    file_refs_by_field: dict[str, list[dict]] | None = None,
+) -> dict:
+    """Serialize a model instance to a JSON-safe dict, respecting the field config.
+
+    ``file`` fields have no backing column — their references live in the
+    ``data_model_files`` side table. Callers pass the row's already-batch-loaded
+    refs as ``file_refs_by_field`` (see ``files_by_row``); without it, file fields
+    serialize as empty (used only off the hot path, e.g. callers with no files).
+    """
+    file_refs_by_field = file_refs_by_field or {}
     fields = data_model.api.fields if data_model.api else None
     if fields is None:
         result: dict[str, Any] = {
@@ -205,6 +182,9 @@ def serialize_row(row: Any, data_model: DataModelDescriptor) -> dict:
     col_map = _column_map(type(row))
     result = {}
     for field in fields:
+        if field.type == "file":
+            result[field.name] = file_refs_by_field.get(field.name, [])
+            continue
         if field.is_computed:
             result[field.name] = _serialize_value(_safe_compute(field, row), field.type or "string")
             continue
@@ -218,26 +198,44 @@ def serialize_row(row: Any, data_model: DataModelDescriptor) -> dict:
     return result
 
 
-def row_file_hashes(row: Any, data_model: DataModelDescriptor) -> set[str]:
-    """The set of attachment hashes referenced by this row's ``file`` fields.
-
-    Used to authorize downloads: a user with read access to a row may only
-    download attachments that row actually references. Models without explicit
-    ``FieldDef(type="file")`` fields reference no downloadable attachments.
-    """
+def _model_has_file_fields(data_model: DataModelDescriptor) -> bool:
     fields = data_model.api.fields if data_model.api else None
-    if not fields:
-        return set()
-    hashes: set[str] = set()
-    for field in fields:
-        if field.type != "file":
-            continue
-        raw = _safe_compute(field, row) if field.is_computed else getattr(row, field.name, None)
-        for ref in _parse_file_refs(raw):
-            file_hash = ref.get("hash")
-            if file_hash:
-                hashes.add(file_hash)
-    return hashes
+    return any(f.type == "file" for f in (fields or []))
+
+
+def files_by_row(
+    data_model: DataModelDescriptor,
+    rows: list,
+    db: Session,
+) -> dict[tuple[uuid.UUID, int], dict[str, list[dict]]]:
+    """Batch-load the file references of a page of rows, keyed by
+    ``(row_id, row_version)`` then field name (ordered by ``position``).
+
+    One query for the whole page — mirrors the ``actions_by_row`` secondary-query
+    pattern so file fields stay free of an N+1.
+    """
+    from actidoo_wfe.wf import repository
+
+    if not _model_has_file_fields(data_model) or not rows:
+        return {}
+    keys = [(row.id, getattr(row, "version", 0) or 0) for row in rows]
+    result: dict[tuple[uuid.UUID, int], dict[str, list[dict]]] = {}
+    for file in repository.find_data_model_files_for_rows(db, data_model.name, keys):
+        by_field = result.setdefault((file.row_id, file.row_version), {})
+        by_field.setdefault(file.field_name, []).append(
+            {
+                "id": str(file.workflow_attachment_id),
+                "hash": file.attachment.hash,
+                "filename": file.filename,
+                "mimetype": file.mimetype,
+            }
+        )
+    return result
+
+
+def _file_refs_for(files_map: dict, row: Any) -> dict[str, list[dict]]:
+    """The per-field file refs for one row from a ``files_by_row`` map."""
+    return files_map.get((row.id, getattr(row, "version", 0) or 0), {})
 
 
 # ---------------------------------------------------------------------------
@@ -297,7 +295,9 @@ def field_metadata(data_model: DataModelDescriptor, *, locale: str | None = None
     col_map = _column_map(model_class)
     result: list[FieldSchema] = []
     for field in fields:
-        if field.is_computed:
+        if field.is_computed or field.type == "file":
+            # Computed and file fields are framework-managed virtual fields with no
+            # backing column (file refs live in the data_model_files side table).
             result.append(
                 FieldSchema(
                     name=field.name,
@@ -307,7 +307,7 @@ def field_metadata(data_model: DataModelDescriptor, *, locale: str | None = None
                     nullable=True,
                     primary_key=False,
                     virtual=True,
-                    sortable=False,  # computed fields have no DB column
+                    sortable=False,  # no DB column to sort by
                     filterable=False,
                 )
             )
@@ -485,9 +485,10 @@ def list_rows(
     paginated = bff_table.get_paginated_data()
 
     actions_map = actions_by_row(data_model, paginated.items, db, user)
+    files_map = files_by_row(data_model, paginated.items, db)
     items = [
         RowResponse(
-            data=serialize_row(row, data_model),
+            data=serialize_row(row, data_model, _file_refs_for(files_map, row)),
             actions=actions_map.get(row.id, []),
         )
         for row in paginated.items
@@ -514,12 +515,14 @@ def version_chain_response(
     chain: list,
     actions: list[ActionSchema] | None = None,
     *,
+    db: Session,
     locale: str | None = None,
 ) -> VersionChainResponse:
+    files_map = files_by_row(data_model, chain, db)
     return VersionChainResponse(
         versions=[
             VersionEntry(
-                data=serialize_row(row, data_model),
+                data=serialize_row(row, data_model, _file_refs_for(files_map, row)),
                 created_at=getattr(row, "created_at", None),
                 action=getattr(row, "action", None),
             )
@@ -601,17 +604,18 @@ def _csv_cell(value: Any) -> str:
     return _neutralize_formula(str(value))
 
 
-def rows_to_csv(data_model: DataModelDescriptor, rows: list, *, locale: str | None = None) -> str:
+def rows_to_csv(data_model: DataModelDescriptor, rows: list, *, db: Session, locale: str | None = None) -> str:
     """Serialize rows to CSV (header = field labels, columns = field order).
 
     The header carries the labels resolved to *locale* — consumers parsing the
     header must match by position or request a fixed locale.
     """
     fields = field_metadata(data_model, locale=locale)
+    files_map = files_by_row(data_model, rows, db)
     output = io.StringIO()
     writer = csv.writer(output, delimiter=";")
     writer.writerow([field.label for field in fields])
     for row in rows:
-        data = serialize_row(row, data_model)
+        data = serialize_row(row, data_model, _file_refs_for(files_map, row))
         writer.writerow([_csv_cell(data.get(field.name)) for field in fields])
     return output.getvalue()

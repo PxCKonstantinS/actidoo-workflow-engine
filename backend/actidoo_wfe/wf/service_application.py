@@ -1053,7 +1053,7 @@ def find_attachment_by_hash(db: Session, workflow_instance_id: uuid.UUID, hash: 
     return Attachment(
         id=att.id,
         hash=att.attachment.hash,
-        filename=att.attachment.first_filename,
+        filename=att.filename,
         mimetype=att.attachment.mimetype,
         data=get_file_content(att.attachment.file.file_id),
     )
@@ -1072,7 +1072,7 @@ def find_all_workflow_attachments(db: Session, workflow_instance_id: uuid.UUID):
             Attachment(
                 id=att.id,
                 hash=att.attachment.hash,
-                filename=att.attachment.first_filename,
+                filename=att.filename,
                 mimetype=att.attachment.mimetype,
                 data=get_file_content(att.attachment.file.file_id),
             ),
@@ -1123,7 +1123,7 @@ def download_attachment(
     return Attachment(
         id=att.id,
         hash=att.attachment.hash,
-        filename=att.attachment.first_filename,
+        filename=att.filename,
         mimetype=att.attachment.mimetype,
         data=get_file_content(att.attachment.file.file_id),
     )
