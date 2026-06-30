@@ -276,12 +276,29 @@ def _run_main_migrations(engine):
         raise Exception("Alembic Path not existing")
 
 
+def _extension_current_revision(alembic_cfg):
+    """Return the extension's current Alembic revision, or None if not yet stamped."""
+    from alembic.runtime.environment import EnvironmentContext
+    from alembic.script import ScriptDirectory
+
+    script = ScriptDirectory.from_config(alembic_cfg)
+    captured: dict = {}
+
+    def _capture(rev, context):
+        captured["revision"] = context.get_current_revision()
+        return []
+
+    with EnvironmentContext(alembic_cfg, script, fn=_capture):
+        script.run_env()
+    return captured.get("revision")
+
+
 def _run_extension_migrations(engine, ext_alembic_module, entry_point_name: str):
     """Run migrations for one extension project, mirroring the main set's pattern.
 
-    On a *fresh* DB (the extension's own Alembic version table does not exist yet)
-    the project's data-model tables are created directly from the ORM models
-    (``metadata.create_all``) and the Alembic history is stamped — the create-table
+    On a *fresh* DB (the extension's Alembic history is not yet stamped) the
+    project's data-model tables are created directly from the ORM models
+    (``metadata.create_all``) and the history is stamped - the create-table
     migrations are not replayed, so a fresh install always matches the current
     models. On an *existing* DB the normal ``upgrade(head)`` applies the deltas;
     new tables and schema changes are then introduced through ordinary migrations.
@@ -298,49 +315,36 @@ def _run_extension_migrations(engine, ext_alembic_module, entry_point_name: str)
 
     from alembic.command import stamp, upgrade
 
-    # The extension's env.py declares its own VERSION_TABLE and imports its models
-    # on import. The module is import-safe (its bottom guard skips migrations when
-    # imported outside Alembic), so importing it both loads the project's models
-    # into the shared metadata/registry and tells us the version-table name.
-    version_table = None
+    # Ask Alembic - through the extension's own env/version_table — whether this
+    # extension has been initialized yet. Running the env also imports the
+    # project's models into the shared metadata and the data-model registry.
     try:
-        import importlib
-
-        env = importlib.import_module(f"{ext_alembic_module.__name__}.env")
-        version_table = getattr(env, "VERSION_TABLE", None)
+        already_stamped = _extension_current_revision(alembic_cfg) is not None
     except Exception as error:  # pragma: no cover - defensive
-        log.warning("Could not import env for extension '%s' (%s); falling back to upgrade.", entry_point_name, error)
+        log.warning("Could not read revision for extension '%s' (%s); running upgrade.", entry_point_name, error)
+        upgrade(config=alembic_cfg, revision="head")
+        return
 
-    if version_table:
-        with engine.connect() as conn:
-            stamped = conn.execute(
-                text(
-                    "SELECT COUNT(*) FROM information_schema.tables "
-                    "WHERE table_schema = DATABASE() AND table_name = :version_table",
-                ),
-                {"version_table": version_table},
-            ).scalar()
+    if not already_stamped:
+        # Fresh DB: build this project's data-model tables from the models and
+        # stamp the history instead of replaying the create-table migrations.
+        from actidoo_wfe.wf.registry_data_model import data_model_registry
 
-        if not stamped:
-            # Fresh DB: build this project's data-model tables from the models and
-            # stamp the history instead of replaying the create-table migrations.
-            from actidoo_wfe.wf.registry_data_model import data_model_registry
-
-            package = ext_alembic_module.__name__.split(".")[0]
-            project_tables = [
-                descriptor.model_class.__table__
-                for descriptor in data_model_registry.list_models()
-                if descriptor.model_class.__module__ == package
-                or descriptor.model_class.__module__.startswith(package + ".")
-            ]
-            metadata.create_all(engine, tables=project_tables)
-            stamp(config=alembic_cfg, revision="head")
-            log.info(
-                "Extension '%s' fresh DB: created %d table(s) from models and stamped head.",
-                entry_point_name,
-                len(project_tables),
-            )
-            return
+        package = ext_alembic_module.__name__.split(".")[0]
+        project_tables = [
+            descriptor.model_class.__table__
+            for descriptor in data_model_registry.list_models()
+            if descriptor.model_class.__module__ == package
+            or descriptor.model_class.__module__.startswith(package + ".")
+        ]
+        metadata.create_all(engine, tables=project_tables)
+        stamp(config=alembic_cfg, revision="head")
+        log.info(
+            "Extension '%s' fresh DB: created %d table(s) from models and stamped head.",
+            entry_point_name,
+            len(project_tables),
+        )
+        return
 
     upgrade(config=alembic_cfg, revision="head")
     log.info("Extension migrations '%s' applied successfully.", entry_point_name)
